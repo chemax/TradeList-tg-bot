@@ -1,15 +1,17 @@
 package tg
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"log"
+	"shoppingbot/internal/list"
+	"shoppingbot/internal/store"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
-
-	"shoppingbot/internal/list"
-	"shoppingbot/internal/store"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 )
@@ -29,6 +31,7 @@ type Bot struct {
 	cfg   Config
 
 	recMu    sync.Mutex
+	lastSig  map[int64]string
 	recMsgID map[int64]int
 
 	debMu sync.Mutex
@@ -40,8 +43,9 @@ type prefs struct {
 	Cols        int  // 2, 3, 4
 	Page        int  // текущая страница
 	ReorderMode bool // режим упорядочивания
-	DelMode     bool // режим быстрого удаления (только для AdminChatID)
+	DelMode     bool // режим быстрого удаления (только AdminChatID)
 	DelCand     string
+	MenuOpen    bool // подменю открыто
 }
 
 var (
@@ -56,7 +60,7 @@ func getPrefs(chatID int64) *prefs {
 	if p != nil {
 		return p
 	}
-	p = &prefs{Cols: 2, Page: 0, ReorderMode: false, DelMode: false, DelCand: ""}
+	p = &prefs{Cols: 2, Page: 0, ReorderMode: false, DelMode: false, DelCand: "", MenuOpen: false}
 	prefMu.Lock()
 	prefsByChat[chatID] = p
 	prefMu.Unlock()
@@ -72,7 +76,24 @@ func New(api *tgbotapi.BotAPI, board *list.Board, st *store.Store, cfg Config) *
 		store:    st,
 		cfg:      cfg,
 		recMsgID: map[int64]int{},
+		lastSig:  map[int64]string{},
 	}
+}
+
+// makeSignature — стабильная сигнатура текста и inline-клавиатуры
+func makeSignature(text string, kb tgbotapi.InlineKeyboardMarkup) string {
+	b, _ := json.Marshal(kb) // нам не критично падать на ошибке — пустой kb просто даст "{}"
+	h := sha256.Sum256(append([]byte(text), b...))
+	return hex.EncodeToString(h[:])
+}
+
+// isNotModifiedErr — true, если это "message is not modified"
+func isNotModifiedErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := strings.ToLower(err.Error())
+	return strings.Contains(s, "message is not modified")
 }
 
 func (b *Bot) Start() {
@@ -107,7 +128,7 @@ func (b *Bot) Start() {
 		if s, _ := b.store.GetSetting(fmt.Sprintf("reorder:%d", cid), "0"); s != "" {
 			getPrefs(cid).ReorderMode = s == "1"
 		}
-		// DelMode не восстанавливаем — это временный режим, только из админ-чата по кнопке
+		// MenuOpen / DelMode не восстанавливаем — это временные UI-состояния
 	}
 
 	// Глобальный фильтр (на всю доску)
@@ -141,44 +162,7 @@ func (b *Bot) onMessage(m *tgbotapi.Message) {
 	switch m.Command() {
 	case "start":
 		b.sendOrEditForChat(m.Chat.ID)
-	case "backup":
-		if m.Chat != nil && b.cfg.AdminChatID != 0 && m.Chat.ID == b.cfg.AdminChatID {
-			go b.doBackup()
-			_, _ = b.api.Send(tgbotapi.NewMessage(m.Chat.ID, "Запускаю бэкап…"))
-		}
-	case "allnot":
-		pr := getPrefs(m.Chat.ID)
-		if pr.DelMode {
-			_, _ = b.api.Send(tgbotapi.NewMessage(m.Chat.ID, "Сейчас включён режим удаления. Выйдите из него, чтобы отметить всё."))
-			return
-		}
 
-		cats, sel, _, _, _ := b.board.GetStateSnapshot()
-		changed := 0
-		for _, c := range cats {
-			if !sel[c] {
-				changed++
-			}
-		}
-
-		if err := b.store.SetAllSelected(true); err == nil {
-			b.board.SetAllSelected(true)
-
-			// агрегированная запись в журнал
-			_ = b.store.AppendJournal(store.JournalEntry{
-				TS:       time.Now(),
-				ChatID:   m.Chat.ID,
-				User:     atName(m.From),
-				Category: fmt.Sprintf("ALL → ☐ (+%d)", changed),
-				From:     false,
-				To:       true,
-			})
-
-			b.scheduleBroadcast()
-			_, _ = b.api.Send(tgbotapi.NewMessage(m.Chat.ID, "Отмечено как не куплено: всё."))
-		} else {
-			_, _ = b.api.Send(tgbotapi.NewMessage(m.Chat.ID, "Не удалось отметить всё: "+err.Error()))
-		}
 	case "two":
 		p := getPrefs(m.Chat.ID)
 		p.Cols, p.Page = 2, 0
@@ -211,6 +195,12 @@ func (b *Bot) onMessage(m *tgbotapi.Message) {
 	case "log":
 		b.sendJournal(m.Chat.ID, 50)
 
+	case "backup":
+		if m.Chat != nil && b.cfg.AdminChatID != 0 && m.Chat.ID == b.cfg.AdminChatID {
+			go b.doBackup()
+			_, _ = b.api.Send(tgbotapi.NewMessage(m.Chat.ID, "Запускаю бэкап…"))
+		}
+
 	case "addcat":
 		args := strings.TrimSpace(strings.TrimPrefix(m.Text, "/addcat"))
 		added := b.addCategoriesFromText(args)
@@ -229,6 +219,35 @@ func (b *Bot) onMessage(m *tgbotapi.Message) {
 		}
 		_, _ = b.api.Send(tgbotapi.NewMessage(m.Chat.ID, reply))
 
+	case "allnot":
+		pr := getPrefs(m.Chat.ID)
+		if pr.DelMode {
+			_, _ = b.api.Send(tgbotapi.NewMessage(m.Chat.ID, "Сейчас включён режим удаления. Выйдите из него, чтобы отметить всё."))
+			return
+		}
+		cats, sel, _, _, _ := b.board.GetStateSnapshot()
+		changed := 0
+		for _, c := range cats {
+			if !sel[c] {
+				changed++
+			}
+		}
+		if err := b.store.SetAllSelected(true); err == nil {
+			b.board.SetAllSelected(true)
+			_ = b.store.AppendJournal(store.JournalEntry{
+				TS:       time.Now(),
+				ChatID:   m.Chat.ID,
+				User:     atName(m.From),
+				Category: fmt.Sprintf("ALL → ☐ (+%d)", changed),
+				From:     false,
+				To:       true,
+			})
+			b.scheduleBroadcast()
+			_, _ = b.api.Send(tgbotapi.NewMessage(m.Chat.ID, "Отмечено как не куплено: всё."))
+		} else {
+			_, _ = b.api.Send(tgbotapi.NewMessage(m.Chat.ID, "Не удалось отметить всё: "+err.Error()))
+		}
+
 	default:
 		b.sendOrEditForChat(m.Chat.ID)
 	}
@@ -242,43 +261,17 @@ func (b *Bot) onCallback(cb *tgbotapi.CallbackQuery) {
 
 	switch {
 	case data == "noop":
-	// ничего, просто закрыть "часики"
-	case data == "all:not":
-		if p.DelMode {
-			break
-		} // в режиме удаления игнорим
+		// ничего, просто закрыть "часики"
 
-		// посчитаем, сколько реально изменится
-		cats, sel, _, _, _ := b.board.GetStateSnapshot()
-		changed := 0
-		for _, c := range cats {
-			if !sel[c] { // было куплено, станет "в списке" (не куплено)
-				changed++
-			}
-		}
-
-		if err := b.store.SetAllSelected(true); err != nil {
-			log.Printf("all:not: %v", err)
-			break
-		}
-		// синхронизируем память и разошлём
-		b.board.SetAllSelected(true)
-
-		// агрегированная запись в журнал — одной строкой
-		_ = b.store.AppendJournal(store.JournalEntry{
-			TS:       time.Now(),
-			ChatID:   cid,
-			User:     atName(cb.From),
-			Category: fmt.Sprintf("ALL → ☐ (+%d)", changed),
-			From:     false, // формально "смешанное", но отображаем как сводную стрелку
-			To:       true,
-		})
-
+	// ----- Подменю -----
+	case data == "menu:open":
+		p.MenuOpen = true
 		b.scheduleBroadcast()
-	case data == "backup:now":
-		if isAdminChat {
-			go b.doBackup() // не блокируем UI, шлём экспорт и файл в админ-чат
-		}
+
+	case data == "menu:close":
+		p.MenuOpen = false
+		b.scheduleBroadcast()
+
 	// ----- Быстрое удаление (только админ-чат) -----
 	case data == "delmode:toggle":
 		if !isAdminChat {
@@ -286,6 +279,7 @@ func (b *Bot) onCallback(cb *tgbotapi.CallbackQuery) {
 		}
 		p.DelMode = !p.DelMode
 		p.DelCand = ""
+		p.MenuOpen = false
 		b.scheduleBroadcast()
 
 	case data == "del:clear":
@@ -300,7 +294,6 @@ func (b *Bot) onCallback(cb *tgbotapi.CallbackQuery) {
 			break
 		}
 		cat := strings.TrimPrefix(data, "del:arm:")
-		// армим выбранную категорию
 		p.DelCand = cat
 		b.scheduleBroadcast()
 
@@ -315,13 +308,12 @@ func (b *Bot) onCallback(cb *tgbotapi.CallbackQuery) {
 		if cats, err := b.store.ListCategories(); err == nil {
 			b.board.ReplaceCategories(cats)
 		}
-		// сбрасываем выбор, остаёмся в режиме удаления
 		p.DelCand = ""
 		b.scheduleBroadcast()
 
-	// ----- Обычный тумблер/колонки/фильтры/порядок -----
+	// ----- Обычные действия (тумблер/колонки/фильтры/порядок/экспорт/журнал/бэкап/всё) -----
 	case strings.HasPrefix(data, "t:"):
-		// если включён режим удаления — игнорируем тумблеры
+		// в режиме удаления игнорируем тумблеры
 		if p.DelMode {
 			break
 		}
@@ -368,6 +360,11 @@ func (b *Bot) onCallback(cb *tgbotapi.CallbackQuery) {
 		}
 		b.sendJournal(cid, 50)
 
+	case data == "backup:now":
+		if isAdminChat {
+			go b.doBackup()
+		}
+
 	case data == "re:toggle":
 		if p.DelMode {
 			break
@@ -375,6 +372,7 @@ func (b *Bot) onCallback(cb *tgbotapi.CallbackQuery) {
 		p.ReorderMode = !p.ReorderMode
 		_ = b.store.SetSetting(fmt.Sprintf("reorder:%d", cid), boolTo01(p.ReorderMode))
 		p.Page = 0
+		p.MenuOpen = false // при входе/выходе из режима порядок — закрыть подменю
 		_ = b.store.SetSetting(fmt.Sprintf("page:%d", cid), "0")
 		b.scheduleBroadcast()
 
@@ -432,6 +430,32 @@ func (b *Bot) onCallback(cb *tgbotapi.CallbackQuery) {
 			_ = b.store.SetSetting(fmt.Sprintf("page:%d", cid), strconv.Itoa(p.Page))
 			b.scheduleBroadcast()
 		}
+
+	case data == "all:not":
+		if p.DelMode {
+			break
+		}
+		cats, sel, _, _, _ := b.board.GetStateSnapshot()
+		changed := 0
+		for _, c := range cats {
+			if !sel[c] {
+				changed++
+			}
+		}
+		if err := b.store.SetAllSelected(true); err != nil {
+			log.Printf("all:not: %v", err)
+			break
+		}
+		b.board.SetAllSelected(true)
+		_ = b.store.AppendJournal(store.JournalEntry{
+			TS:       time.Now(),
+			ChatID:   cid,
+			User:     atName(cb.From),
+			Category: fmt.Sprintf("ALL → ☐ (+%d)", changed),
+			From:     false,
+			To:       true,
+		})
+		b.scheduleBroadcast()
 	}
 
 	_ = b.answerCallback(cb, "")
@@ -478,12 +502,20 @@ func (b *Bot) applyFilterArg(arg string) {
 
 func (b *Bot) sendOrEditForChat(chatID int64) {
 	text, kb := b.render(chatID)
+	sig := makeSignature(text, kb)
 
 	b.recMu.Lock()
 	msgID := b.recMsgID[chatID]
+	prevSig := b.lastSig[chatID]
 	b.recMu.Unlock()
 
+	// Если уже есть сообщение и контент не менялся — ничего не делаем
+	if msgID != 0 && prevSig == sig {
+		return
+	}
+
 	if msgID == 0 {
+		// Первичная отправка
 		msg := tgbotapi.NewMessage(chatID, text)
 		msg.ReplyMarkup = kb
 		sent, err := b.api.Send(msg)
@@ -493,12 +525,22 @@ func (b *Bot) sendOrEditForChat(chatID int64) {
 		}
 		b.recMu.Lock()
 		b.recMsgID[chatID] = sent.MessageID
+		b.lastSig[chatID] = sig
 		b.recMu.Unlock()
 		return
 	}
 
+	// Редактирование существующего сообщения
 	edit := tgbotapi.NewEditMessageTextAndMarkup(chatID, msgID, text, kb)
 	if _, err := b.api.Request(edit); err != nil {
+		if isNotModifiedErr(err) {
+			// Ничего не изменилось — просто зафиксируем текущую сигнатуру и выйдем без resend
+			b.recMu.Lock()
+			b.lastSig[chatID] = sig
+			b.recMu.Unlock()
+			return
+		}
+		// Другие ошибки — попробуем переслать заново (как было)
 		log.Printf("edit %d: %v -> resend", chatID, err)
 		msg := tgbotapi.NewMessage(chatID, text)
 		msg.ReplyMarkup = kb
@@ -509,36 +551,38 @@ func (b *Bot) sendOrEditForChat(chatID int64) {
 		}
 		b.recMu.Lock()
 		b.recMsgID[chatID] = sent.MessageID
+		b.lastSig[chatID] = sig
 		b.recMu.Unlock()
+		return
 	}
+
+	// Успешно отредактировали — обновим сигнатуру
+	b.recMu.Lock()
+	b.lastSig[chatID] = sig
+	b.recMu.Unlock()
 }
 
+// Вместо текущей scheduleBroadcast — используем AfterFunc.
 func (b *Bot) scheduleBroadcast() {
+	const delay = 250 * time.Millisecond
 	b.debMu.Lock()
 	defer b.debMu.Unlock()
-	const delay = 250 * time.Millisecond
+
+	// Первый запуск: создаём таймер, который один раз вызовет broadcast.
 	if b.debT == nil {
-		b.debT = time.NewTimer(delay)
-		go func() {
-			for range b.debT.C {
-				b.broadcast()
-				b.debMu.Lock()
-				if !b.debT.Stop() {
-					select {
-					case <-b.debT.C:
-					default:
-					}
-				}
-				b.debMu.Unlock()
-			}
-		}()
+		b.debT = time.AfterFunc(delay, func() {
+			// Вызовем рассылку
+			b.broadcast()
+			// Обнулим таймер чтобы последующие вызовы снова могли его создать
+			b.debMu.Lock()
+			b.debT = nil
+			b.debMu.Unlock()
+		})
+		return
 	}
-	if !b.debT.Stop() {
-		select {
-		case <-b.debT.C:
-		default:
-		}
-	}
+
+	// Таймер уже есть → просто перезапускаем отсчёт
+	// (Reset безопасен для AfterFunc, это каноничный паттерн дебаунса).
 	b.debT.Reset(delay)
 }
 
@@ -556,22 +600,22 @@ func (b *Bot) render(chatID int64) (string, tgbotapi.InlineKeyboardMarkup) {
 	cols, page := p.Cols, p.Page
 	reorder := p.ReorderMode
 	delmode := p.DelMode
+	menu := p.MenuOpen
 	isAdminChat := (b.cfg.AdminChatID != 0 && chatID == b.cfg.AdminChatID)
 
-	// режим удаления: список всегда полный, без фильтрации (чтобы ничего не спрятать)
+	// в режиме удаления — показываем весь список, без фильтра
 	if delmode {
 		vis = append([]string(nil), cats...)
 	}
 
-	// пагинация «по необходимости»
+	// пагинация
 	maxRows := b.cfg.SoftMaxRows
 	if maxRows <= 0 {
 		maxRows = 12
 	}
-
 	perPage := cols * maxRows
-	if reorder || delmode { // одна категория = одна строка
-		perPage = maxRows
+	if reorder || delmode {
+		perPage = maxRows // одна категория = одна строка
 	}
 
 	pages := 1
@@ -603,7 +647,10 @@ func (b *Bot) render(chatID int64) (string, tgbotapi.InlineKeyboardMarkup) {
 		modeTxt = " • Режим: ↕️ Порядок"
 	}
 	if delmode {
-		modeTxt = " • Режим: 🗑 Удаление (только админ)"
+		modeTxt = " • Режим: 🗑 Удаление"
+	}
+	if menu {
+		modeTxt += " • Меню"
 	}
 	summary := b.board.SummaryLine()
 
@@ -611,19 +658,18 @@ func (b *Bot) render(chatID int64) (string, tgbotapi.InlineKeyboardMarkup) {
 	fmt.Fprintf(&bld, "%s\n%s\nФильтр: %s%s\n\n", title, summary, filterTxt, modeTxt)
 	if len(vis) == 0 {
 		bld.WriteString("— (пусто)")
-	} else if !delmode {
-		for _, c := range vis {
-			if sel[c] {
-				bld.WriteString("• ☐ ")
-			} else {
-				bld.WriteString("• ✅ ")
-			}
-			bld.WriteString(c)
-			bld.WriteString("\n")
-		}
 	} else {
+		// в режимах порядок/удаление префиксы в тексте тоже оставим простыми
 		for _, c := range vis {
-			bld.WriteString("• ")
+			if !delmode && !reorder {
+				if sel[c] {
+					bld.WriteString("• ☐ ")
+				} else {
+					bld.WriteString("• ✅ ")
+				}
+			} else {
+				bld.WriteString("• ")
+			}
 			bld.WriteString(c)
 			bld.WriteString("\n")
 		}
@@ -633,8 +679,8 @@ func (b *Bot) render(chatID int64) (string, tgbotapi.InlineKeyboardMarkup) {
 	// клавиатура
 	var rows [][]tgbotapi.InlineKeyboardButton
 
+	// ----- режим удаления -----
 	if delmode {
-		// режим быстрое удаление
 		for _, c := range vis {
 			if p.DelCand == c {
 				btn := tgbotapi.NewInlineKeyboardButtonData("❗Подтвердить: "+c, "del:confirm:"+c)
@@ -644,109 +690,121 @@ func (b *Bot) render(chatID int64) (string, tgbotapi.InlineKeyboardMarkup) {
 				rows = append(rows, []tgbotapi.InlineKeyboardButton{btn})
 			}
 		}
-		// футер админ-режима
-		foot := []tgbotapi.InlineKeyboardButton{
+		// назад
+		rows = append(rows, []tgbotapi.InlineKeyboardButton{
 			tgbotapi.NewInlineKeyboardButtonData("↩️ Назад", "delmode:toggle"),
-		}
-		if p.DelCand != "" {
-			foot = append(foot, tgbotapi.NewInlineKeyboardButtonData("Отмена выбора", "del:clear"))
-		}
-		rows = append(rows, foot)
-
-		// пагинация (если нужна)
-		pages := b.totalPages(cols, true)
+		})
+		// пагинация
 		if pages > 1 {
-			pg := []tgbotapi.InlineKeyboardButton{
+			rows = append(rows, []tgbotapi.InlineKeyboardButton{
 				tgbotapi.NewInlineKeyboardButtonData(fmt.Sprintf("◀️ %d/%d", page+1, pages), "p:prev"),
 				tgbotapi.NewInlineKeyboardButtonData("▶️", "p:next"),
-			}
-			rows = append(rows, pg)
+			})
 		}
-
 		return text, tgbotapi.NewInlineKeyboardMarkup(rows...)
 	}
 
-	if !reorder {
-		// обычный режим: тумблеры (2/3/4 колонки)
-		row := make([]tgbotapi.InlineKeyboardButton, 0, cols)
-		for _, c := range vis {
-			label := "☐ " + c
-			if !sel[c] {
-				label = "✅ " + c
-			}
-			row = append(row, tgbotapi.NewInlineKeyboardButtonData(label, "t:"+c))
-			if len(row) == cols {
-				rows = append(rows, row)
-				row = make([]tgbotapi.InlineKeyboardButton, 0, cols)
-			}
-		}
-		if len(row) > 0 {
-			rows = append(rows, row)
-		}
-	} else {
-		// режим порядка: ⬆️  «≡ Cat»  ⬇️
+	// ----- режим порядка -----
+	if reorder {
 		for _, c := range vis {
 			up := tgbotapi.NewInlineKeyboardButtonData("⬆️", "up:"+c)
-			center := tgbotapi.NewInlineKeyboardButtonData("≡ "+c, "top:"+c) // клик по названию -> вверх
+			center := tgbotapi.NewInlineKeyboardButtonData("≡ "+c, "top:"+c)
 			down := tgbotapi.NewInlineKeyboardButtonData("⬇️", "down:"+c)
 			rows = append(rows, []tgbotapi.InlineKeyboardButton{up, center, down})
 		}
+		// кнопка «Готово»
+		rows = append(rows, []tgbotapi.InlineKeyboardButton{
+			tgbotapi.NewInlineKeyboardButtonData("✅ Готово", "re:toggle"),
+		})
+		// пагинация
+		if pages > 1 {
+			rows = append(rows, []tgbotapi.InlineKeyboardButton{
+				tgbotapi.NewInlineKeyboardButtonData(fmt.Sprintf("◀️ %d/%d", page+1, pages), "p:prev"),
+				tgbotapi.NewInlineKeyboardButtonData("▶️", "p:next"),
+			})
+		}
+		return text, tgbotapi.NewInlineKeyboardMarkup(rows...)
 	}
 
-	// футер: колонки (2/3/4) — показываем только в обычном режиме
-	if !reorder {
-		ctrl := []tgbotapi.InlineKeyboardButton{
+	// ----- обычный режим (категории + подменю + пагинация) -----
+	// 1) категории (тумблеры)
+	row := make([]tgbotapi.InlineKeyboardButton, 0, cols)
+	for _, c := range vis {
+		label := "☐ " + c
+		if !sel[c] {
+			label = "✅ " + c
+		}
+		row = append(row, tgbotapi.NewInlineKeyboardButtonData(label, "t:"+c))
+		if len(row) == cols {
+			rows = append(rows, row)
+			row = make([]tgbotapi.InlineKeyboardButton, 0, cols)
+		}
+	}
+	if len(row) > 0 {
+		rows = append(rows, row)
+	}
+
+	// 2) подменю
+	if !menu {
+		// только кнопка «⋯ Меню»
+		rows = append(rows, []tgbotapi.InlineKeyboardButton{
+			tgbotapi.NewInlineKeyboardButtonData("⋯ Меню", "menu:open"),
+		})
+	} else {
+		// заголовок подменю: Назад
+		rows = append(rows, []tgbotapi.InlineKeyboardButton{
+			tgbotapi.NewInlineKeyboardButtonData("⬅️ Назад", "menu:close"),
+		})
+
+		// Фильтры
+		rows = append(rows, []tgbotapi.InlineKeyboardButton{
+			tgbotapi.NewInlineKeyboardButtonData("Все", "f:all"),
+			tgbotapi.NewInlineKeyboardButtonData("☐ Не куплено", "f:not"),
+			tgbotapi.NewInlineKeyboardButtonData("✅ Куплено", "f:done"),
+		})
+
+		// Колонки
+		rows = append(rows, []tgbotapi.InlineKeyboardButton{
 			tgbotapi.NewInlineKeyboardButtonData("2 колонки", "c:2"),
 			tgbotapi.NewInlineKeyboardButtonData("3 колонки", "c:3"),
 			tgbotapi.NewInlineKeyboardButtonData("4 колонки", "c:4"),
+		})
+
+		// Действия: добавить / всё некупленным
+		addBtn := tgbotapi.InlineKeyboardButton{Text: "➕ Категория"}
+		empty := ""
+		addBtn.SwitchInlineQueryCurrentChat = &empty
+		rows = append(rows, []tgbotapi.InlineKeyboardButton{
+			addBtn,
+			tgbotapi.NewInlineKeyboardButtonData("☐ Всё", "all:not"),
+		})
+
+		// Экспорт / Журнал
+		rows = append(rows, []tgbotapi.InlineKeyboardButton{
+			tgbotapi.NewInlineKeyboardButtonData("📤 Экспорт", "exp:cur"),
+			tgbotapi.NewInlineKeyboardButtonData("📜 Журнал", "log:show"),
+		})
+
+		// Порядок (включение режима)
+		rows = append(rows, []tgbotapi.InlineKeyboardButton{
+			tgbotapi.NewInlineKeyboardButtonData("↕️ Порядок", "re:toggle"),
+		})
+
+		// Админ-блок
+		if isAdminChat {
+			rows = append(rows, []tgbotapi.InlineKeyboardButton{
+				tgbotapi.NewInlineKeyboardButtonData("🗑 Удалить", "delmode:toggle"),
+				tgbotapi.NewInlineKeyboardButtonData("💾 Бэкап", "backup:now"),
+			})
 		}
-		rows = append(rows, ctrl)
 	}
 
-	// футер: фильтры
-	fRow := []tgbotapi.InlineKeyboardButton{
-		tgbotapi.NewInlineKeyboardButtonData("Все", "f:all"),
-		tgbotapi.NewInlineKeyboardButtonData("☐ Не куплено", "f:not"),
-		tgbotapi.NewInlineKeyboardButtonData("✅ Куплено", "f:done"),
-	}
-	rows = append(rows, fRow)
-
-	// футер: действия
-	addBtn := tgbotapi.InlineKeyboardButton{Text: "➕ Категория"}
-	empty := ""
-	addBtn.SwitchInlineQueryCurrentChat = &empty
-
-	act := []tgbotapi.InlineKeyboardButton{addBtn}
-	// Кнопка экспорта и журнала всегда доступны
-	act = append(act,
-		tgbotapi.NewInlineKeyboardButtonData("☐ Всё", "all:not"),
-		tgbotapi.NewInlineKeyboardButtonData("📤 Экспорт", "exp:cur"),
-		tgbotapi.NewInlineKeyboardButtonData("📜 Журнал", "log:show"),
-	)
-	// Админская кнопка «🗑 Удалить» — только в админ-чате
-	if isAdminChat {
-		act = append(act, tgbotapi.NewInlineKeyboardButtonData("🗑 Удалить", "delmode:toggle"))
-		act = append(act, tgbotapi.NewInlineKeyboardButtonData("💾 Бэкап", "backup:now"))
-	}
-	rows = append(rows, act)
-
-	// футер: режим порядка
-	reBtnText := "↕️ Порядок"
-	if reorder {
-		reBtnText = "✅ Готово"
-	}
-	rows = append(rows, []tgbotapi.InlineKeyboardButton{
-		tgbotapi.NewInlineKeyboardButtonData(reBtnText, "re:toggle"),
-	})
-
-	// футер: пагинация (если нужна)
-	pages = b.totalPages(cols, reorder)
+	// 3) пагинация (всегда внизу, если нужна)
 	if pages > 1 {
-		pg := []tgbotapi.InlineKeyboardButton{
+		rows = append(rows, []tgbotapi.InlineKeyboardButton{
 			tgbotapi.NewInlineKeyboardButtonData(fmt.Sprintf("◀️ %d/%d", page+1, pages), "p:prev"),
 			tgbotapi.NewInlineKeyboardButtonData("▶️", "p:next"),
-		}
-		rows = append(rows, pg)
+		})
 	}
 
 	return text, tgbotapi.NewInlineKeyboardMarkup(rows...)
@@ -772,12 +830,10 @@ func (b *Bot) sendJournal(chatID int64, limit int) {
 		_, _ = b.api.Send(tgbotapi.NewMessage(chatID, "Журнал пуст."))
 		return
 	}
-
 	var sb strings.Builder
 	sb.WriteString("```text\n")
 	for i := range entries {
 		e := entries[i]
-		// true = в списке (не куплено) => ☐ ; false = куплено => ✅
 		from := "✅"
 		if e.From {
 			from = "☐"
@@ -786,17 +842,10 @@ func (b *Bot) sendJournal(chatID int64, limit int) {
 		if e.To {
 			to = "☐"
 		}
-
-		// Добавили [Категория]
-		sb.WriteString(fmt.Sprintf("%s  %s  [%s]  %s → %s  \n",
-			e.TS.Format("2006-01-02 15:04"),
-			e.User,
-			e.Category,
-			from, to,
-		))
+		sb.WriteString(fmt.Sprintf("%s  %s  [%s]  %s → %s  (%d)\n",
+			e.TS.Format("2006-01-02 15:04"), e.User, e.Category, from, to, e.ChatID))
 	}
 	sb.WriteString("```")
-
 	msg := tgbotapi.NewMessage(chatID, sb.String())
 	msg.ParseMode = "Markdown"
 	_, _ = b.api.Send(msg)
@@ -864,7 +913,12 @@ func atName(u *tgbotapi.User) string {
 	return u.FirstName
 }
 
-func strPtr(s string) *string { return &s }
+func boolTo01(b bool) string {
+	if b {
+		return "1"
+	}
+	return "0"
+}
 
 // --- вспомогательные для add/del категорий ---
 func (b *Bot) addCategoriesFromText(s string) int {
@@ -925,11 +979,4 @@ func splitCats(s string) []string {
 		}
 	}
 	return out
-}
-
-func boolTo01(b bool) string {
-	if b {
-		return "1"
-	}
-	return "0"
 }
