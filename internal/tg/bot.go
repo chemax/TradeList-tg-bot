@@ -6,12 +6,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
-	"shoppingbot/internal/list"
-	"shoppingbot/internal/store"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
+
+	"shoppingbot/internal/list"
+	"shoppingbot/internal/store"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 )
@@ -21,7 +22,7 @@ type Config struct {
 	AdminChatID     int64   // чат для бэкапов и админ-режимов (0 = выкл)
 	BackupEveryDays int     // раз в N дней
 	DBPath          string  // путь к sqlite для отправки файла
-	SoftMaxRows     int     // «мягкий» предел строк до пагинации (до лимитов Telegram)
+	SoftMaxRows     int     // дефолт строк на страницу, если нет пер-чатной настройки
 }
 
 type Bot struct {
@@ -31,11 +32,13 @@ type Bot struct {
 	cfg   Config
 
 	recMu    sync.Mutex
-	lastSig  map[int64]string
 	recMsgID map[int64]int
 
 	debMu sync.Mutex
-	debT  *time.Timer
+	debT  *time.Timer // дебаунс-таймер (через AfterFunc)
+
+	// последняя сигнатура текста+клавиатуры для каждого чата
+	lastSig map[int64]string
 }
 
 // ---- пер-чат настройки отображения ----
@@ -46,6 +49,7 @@ type prefs struct {
 	DelMode     bool // режим быстрого удаления (только AdminChatID)
 	DelCand     string
 	MenuOpen    bool // подменю открыто
+	Rows        int  // максимум строк на страницу (пер-чат)
 }
 
 var (
@@ -60,7 +64,15 @@ func getPrefs(chatID int64) *prefs {
 	if p != nil {
 		return p
 	}
-	p = &prefs{Cols: 2, Page: 0, ReorderMode: false, DelMode: false, DelCand: "", MenuOpen: false}
+	p = &prefs{
+		Cols:        2,
+		Page:        0,
+		ReorderMode: false,
+		DelMode:     false,
+		DelCand:     "",
+		MenuOpen:    false,
+		Rows:        0, // возьмём дефолт потом
+	}
 	prefMu.Lock()
 	prefsByChat[chatID] = p
 	prefMu.Unlock()
@@ -80,22 +92,6 @@ func New(api *tgbotapi.BotAPI, board *list.Board, st *store.Store, cfg Config) *
 	}
 }
 
-// makeSignature — стабильная сигнатура текста и inline-клавиатуры
-func makeSignature(text string, kb tgbotapi.InlineKeyboardMarkup) string {
-	b, _ := json.Marshal(kb) // нам не критично падать на ошибке — пустой kb просто даст "{}"
-	h := sha256.Sum256(append([]byte(text), b...))
-	return hex.EncodeToString(h[:])
-}
-
-// isNotModifiedErr — true, если это "message is not modified"
-func isNotModifiedErr(err error) bool {
-	if err == nil {
-		return false
-	}
-	s := strings.ToLower(err.Error())
-	return strings.Contains(s, "message is not modified")
-}
-
 func (b *Bot) Start() {
 	// Восстановить отмеченные категории
 	if sel, err := b.store.LoadSelected(); err == nil {
@@ -113,7 +109,7 @@ func (b *Bot) Start() {
 		b.board.ReplaceCategories(cats)
 	}
 
-	// Поднять пер-чат настройки (cols/page/reorder) для известных получателей
+	// Поднять пер-чат настройки (cols/page/reorder/rows) для известных получателей
 	for _, cid := range b.cfg.ChatIDs {
 		if s, _ := b.store.GetSetting(fmt.Sprintf("cols:%d", cid), "2"); s != "" {
 			if v, err := strconv.Atoi(s); err == nil && v >= 2 && v <= 4 {
@@ -127,6 +123,11 @@ func (b *Bot) Start() {
 		}
 		if s, _ := b.store.GetSetting(fmt.Sprintf("reorder:%d", cid), "0"); s != "" {
 			getPrefs(cid).ReorderMode = s == "1"
+		}
+		if s, _ := b.store.GetSetting(fmt.Sprintf("rows:%d", cid), strconv.Itoa(b.defaultRows())); s != "" {
+			if v, err := strconv.Atoi(s); err == nil && v > 0 {
+				getPrefs(cid).Rows = v
+			}
 		}
 		// MenuOpen / DelMode не восстанавливаем — это временные UI-состояния
 	}
@@ -311,7 +312,7 @@ func (b *Bot) onCallback(cb *tgbotapi.CallbackQuery) {
 		p.DelCand = ""
 		b.scheduleBroadcast()
 
-	// ----- Обычные действия (тумблер/колонки/фильтры/порядок/экспорт/журнал/бэкап/всё) -----
+	// ----- Обычные действия (тумблер/колонки/фильтры/порядок/экспорт/журнал/бэкап/всё/строки) -----
 	case strings.HasPrefix(data, "t:"):
 		// в режиме удаления игнорируем тумблеры
 		if p.DelMode {
@@ -321,8 +322,12 @@ func (b *Bot) onCallback(cb *tgbotapi.CallbackQuery) {
 		from, to := b.board.Toggle(cat)
 		_ = b.store.SetSelected(cat, to)
 		_ = b.store.AppendJournal(store.JournalEntry{
-			TS: time.Now(), ChatID: cid, User: atName(cb.From),
-			Category: cat, From: from, To: to,
+			TS:       time.Now(),
+			ChatID:   cid,
+			User:     atName(cb.From),
+			Category: cat,
+			From:     from,
+			To:       to,
 		})
 		b.scheduleBroadcast()
 
@@ -337,6 +342,37 @@ func (b *Bot) onCallback(cb *tgbotapi.CallbackQuery) {
 		}
 		p.Cols, p.Page = v, 0
 		_ = b.store.SetSetting(fmt.Sprintf("cols:%d", cid), strconv.Itoa(v))
+		_ = b.store.SetSetting(fmt.Sprintf("page:%d", cid), "0")
+		b.scheduleBroadcast()
+
+	case strings.HasPrefix(data, "r:"):
+		if p.DelMode {
+			break
+		}
+		val := strings.TrimPrefix(data, "r:")
+
+		// Текущее значение (с дефолтом)
+		cur := p.Rows
+		if cur <= 0 {
+			cur = b.defaultRows()
+		}
+
+		switch val {
+		case "+8":
+			cur += 8
+		case "-8":
+			cur -= 8
+		default:
+			// совместимость: r:<число>
+			if v, err := strconv.Atoi(val); err == nil && v > 0 {
+				cur = v
+			}
+		}
+		cur = b.clampRows(cur)
+
+		p.Rows = cur
+		p.Page = 0
+		_ = b.store.SetSetting(fmt.Sprintf("rows:%d", cid), strconv.Itoa(cur))
 		_ = b.store.SetSetting(fmt.Sprintf("page:%d", cid), "0")
 		b.scheduleBroadcast()
 
@@ -416,7 +452,7 @@ func (b *Bot) onCallback(cb *tgbotapi.CallbackQuery) {
 		b.scheduleBroadcast()
 
 	case data == "p:prev":
-		total := b.totalPages(p.Cols, p.ReorderMode || p.DelMode)
+		total := b.totalPages(p.Cols, p.Rows, p.ReorderMode || p.DelMode)
 		if total > 0 {
 			p.Page = (p.Page - 1 + total) % total
 			_ = b.store.SetSetting(fmt.Sprintf("page:%d", cid), strconv.Itoa(p.Page))
@@ -424,7 +460,7 @@ func (b *Bot) onCallback(cb *tgbotapi.CallbackQuery) {
 		}
 
 	case data == "p:next":
-		total := b.totalPages(p.Cols, p.ReorderMode || p.DelMode)
+		total := b.totalPages(p.Cols, p.Rows, p.ReorderMode || p.DelMode)
 		if total > 0 {
 			p.Page = (p.Page + 1) % total
 			_ = b.store.SetSetting(fmt.Sprintf("page:%d", cid), strconv.Itoa(p.Page))
@@ -540,7 +576,7 @@ func (b *Bot) sendOrEditForChat(chatID int64) {
 			b.recMu.Unlock()
 			return
 		}
-		// Другие ошибки — попробуем переслать заново (как было)
+		// Другие ошибки — попробуем переслать заново (как раньше)
 		log.Printf("edit %d: %v -> resend", chatID, err)
 		msg := tgbotapi.NewMessage(chatID, text)
 		msg.ReplyMarkup = kb
@@ -562,27 +598,22 @@ func (b *Bot) sendOrEditForChat(chatID int64) {
 	b.recMu.Unlock()
 }
 
-// Вместо текущей scheduleBroadcast — используем AfterFunc.
+// Дебаунс рассылки: безопасно через time.AfterFunc (без Stop на nil)
 func (b *Bot) scheduleBroadcast() {
 	const delay = 250 * time.Millisecond
 	b.debMu.Lock()
 	defer b.debMu.Unlock()
 
-	// Первый запуск: создаём таймер, который один раз вызовет broadcast.
 	if b.debT == nil {
 		b.debT = time.AfterFunc(delay, func() {
-			// Вызовем рассылку
 			b.broadcast()
-			// Обнулим таймер чтобы последующие вызовы снова могли его создать
 			b.debMu.Lock()
 			b.debT = nil
 			b.debMu.Unlock()
 		})
 		return
 	}
-
 	// Таймер уже есть → просто перезапускаем отсчёт
-	// (Reset безопасен для AfterFunc, это каноничный паттерн дебаунса).
 	b.debT.Reset(delay)
 }
 
@@ -603,19 +634,21 @@ func (b *Bot) render(chatID int64) (string, tgbotapi.InlineKeyboardMarkup) {
 	menu := p.MenuOpen
 	isAdminChat := (b.cfg.AdminChatID != 0 && chatID == b.cfg.AdminChatID)
 
+	// Текущее число строк
+	curRows := p.Rows
+	if curRows <= 0 {
+		curRows = b.defaultRows()
+	}
+
 	// в режиме удаления — показываем весь список, без фильтра
 	if delmode {
 		vis = append([]string(nil), cats...)
 	}
 
 	// пагинация
-	maxRows := b.cfg.SoftMaxRows
-	if maxRows <= 0 {
-		maxRows = 12
-	}
-	perPage := cols * maxRows
+	perPage := cols * curRows
 	if reorder || delmode {
-		perPage = maxRows // одна категория = одна строка
+		perPage = curRows // одна категория = одна строка
 	}
 
 	pages := 1
@@ -659,7 +692,6 @@ func (b *Bot) render(chatID int64) (string, tgbotapi.InlineKeyboardMarkup) {
 	if len(vis) == 0 {
 		bld.WriteString("— (пусто)")
 	} else {
-		// в режимах порядок/удаление префиксы в тексте тоже оставим простыми
 		for _, c := range vis {
 			if !delmode && !reorder {
 				if sel[c] {
@@ -708,7 +740,7 @@ func (b *Bot) render(chatID int64) (string, tgbotapi.InlineKeyboardMarkup) {
 	if reorder {
 		for _, c := range vis {
 			up := tgbotapi.NewInlineKeyboardButtonData("⬆️", "up:"+c)
-			center := tgbotapi.NewInlineKeyboardButtonData("≡ "+c, "top:"+c)
+			center := tgbotapi.NewInlineKeyboardButtonData("≡ "+c, "top:"+c) // клик по названию -> вверх
 			down := tgbotapi.NewInlineKeyboardButtonData("⬇️", "down:"+c)
 			rows = append(rows, []tgbotapi.InlineKeyboardButton{up, center, down})
 		}
@@ -731,7 +763,7 @@ func (b *Bot) render(chatID int64) (string, tgbotapi.InlineKeyboardMarkup) {
 	row := make([]tgbotapi.InlineKeyboardButton, 0, cols)
 	for _, c := range vis {
 		label := "☐ " + c
-		if !sel[c] {
+		if !sel[c] { // false = куплено => ✅
 			label = "✅ " + c
 		}
 		row = append(row, tgbotapi.NewInlineKeyboardButtonData(label, "t:"+c))
@@ -769,6 +801,12 @@ func (b *Bot) render(chatID int64) (string, tgbotapi.InlineKeyboardMarkup) {
 			tgbotapi.NewInlineKeyboardButtonData("3 колонки", "c:3"),
 			tgbotapi.NewInlineKeyboardButtonData("4 колонки", "c:4"),
 		})
+
+		// Строки: −8 / текущие / +8
+		dec := tgbotapi.NewInlineKeyboardButtonData("−8", "r:-8")
+		mid := tgbotapi.InlineKeyboardButton{Text: fmt.Sprintf("Строк %d", curRows), CallbackData: strPtr("noop")}
+		inc := tgbotapi.NewInlineKeyboardButtonData("+8", "r:+8")
+		rows = append(rows, []tgbotapi.InlineKeyboardButton{dec, mid, inc})
 
 		// Действия: добавить / всё некупленным
 		addBtn := tgbotapi.InlineKeyboardButton{Text: "➕ Категория"}
@@ -851,11 +889,11 @@ func (b *Bot) sendJournal(chatID int64, limit int) {
 	_, _ = b.api.Send(msg)
 }
 
-func (b *Bot) totalPages(cols int, singleRow bool) int {
+func (b *Bot) totalPages(cols int, rows int, singleRow bool) int {
 	vis := b.board.Visible()
-	maxRows := b.cfg.SoftMaxRows
+	maxRows := rows
 	if maxRows <= 0 {
-		maxRows = 12
+		maxRows = b.defaultRows()
 	}
 	perPage := cols * maxRows
 	if singleRow {
@@ -919,6 +957,41 @@ func boolTo01(b bool) string {
 	}
 	return "0"
 }
+
+func (b *Bot) defaultRows() int {
+	if b.cfg.SoftMaxRows > 0 {
+		return b.cfg.SoftMaxRows
+	}
+	return 12
+}
+
+func (b *Bot) clampRows(n int) int {
+	if n < 4 {
+		return 4
+	}
+	if n > 48 {
+		return 48
+	}
+	return n
+}
+
+// makeSignature — стабильная сигнатура текста и inline-клавиатуры
+func makeSignature(text string, kb tgbotapi.InlineKeyboardMarkup) string {
+	bin, _ := json.Marshal(kb)
+	h := sha256.Sum256(append([]byte(text), bin...))
+	return hex.EncodeToString(h[:])
+}
+
+// isNotModifiedErr — true, если это "message is not modified"
+func isNotModifiedErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := strings.ToLower(err.Error())
+	return strings.Contains(s, "message is not modified")
+}
+
+func strPtr(s string) *string { return &s }
 
 // --- вспомогательные для add/del категорий ---
 func (b *Bot) addCategoriesFromText(s string) int {
