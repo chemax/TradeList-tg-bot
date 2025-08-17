@@ -307,3 +307,40 @@ func (s *Store) MoveCategoryTop(name string) error {
 	}
 	return tx.Commit()
 }
+
+// SetAllSelected устанавливает всем категориям признак "в списке" (не куплено) = on.
+// Совместимо с любой версией SQLite: без ON CONFLICT DO UPDATE.
+// Делается атомарно: UPDATE существующих + INSERT недостающих в одной транзакции.
+func (s *Store) SetAllSelected(on bool) error {
+	val := 0
+	if on {
+		val = 1
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+
+	// 1) Обновить все уже существующие записи selected для категорий
+	if _, err := tx.Exec(`
+		UPDATE selected
+		   SET is_on = ?
+		 WHERE category IN (SELECT name FROM categories)
+	`, val); err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+
+	// 2) Вставить недостающие записи selected для категорий, которых ещё нет в selected
+	if _, err := tx.Exec(`
+		INSERT INTO selected(category, is_on)
+		SELECT c.name, ?
+		  FROM categories c
+		 WHERE NOT EXISTS (SELECT 1 FROM selected s WHERE s.category = c.name)
+	`, val); err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+
+	return tx.Commit()
+}

@@ -156,3 +156,19 @@ func copyMap(m map[string]bool) map[string]bool {
 }
 
 func JoinLines(lines []string) string { return strings.Join(lines, "\n") }
+
+// SetAllSelected отмечает/снимает все категории на доске.
+func (b *Board) SetAllSelected(on bool) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if on {
+		for _, c := range b.Categories {
+			b.Selected[c] = true
+		}
+	} else {
+		// очистить все отметки (если когда-нибудь понадобится)
+		for k := range b.Selected {
+			delete(b.Selected, k)
+		}
+	}
+}

@@ -146,6 +146,39 @@ func (b *Bot) onMessage(m *tgbotapi.Message) {
 			go b.doBackup()
 			_, _ = b.api.Send(tgbotapi.NewMessage(m.Chat.ID, "Запускаю бэкап…"))
 		}
+	case "allnot":
+		pr := getPrefs(m.Chat.ID)
+		if pr.DelMode {
+			_, _ = b.api.Send(tgbotapi.NewMessage(m.Chat.ID, "Сейчас включён режим удаления. Выйдите из него, чтобы отметить всё."))
+			return
+		}
+
+		cats, sel, _, _, _ := b.board.GetStateSnapshot()
+		changed := 0
+		for _, c := range cats {
+			if !sel[c] {
+				changed++
+			}
+		}
+
+		if err := b.store.SetAllSelected(true); err == nil {
+			b.board.SetAllSelected(true)
+
+			// агрегированная запись в журнал
+			_ = b.store.AppendJournal(store.JournalEntry{
+				TS:       time.Now(),
+				ChatID:   m.Chat.ID,
+				User:     atName(m.From),
+				Category: fmt.Sprintf("ALL → ☐ (+%d)", changed),
+				From:     false,
+				To:       true,
+			})
+
+			b.scheduleBroadcast()
+			_, _ = b.api.Send(tgbotapi.NewMessage(m.Chat.ID, "Отмечено как не куплено: всё."))
+		} else {
+			_, _ = b.api.Send(tgbotapi.NewMessage(m.Chat.ID, "Не удалось отметить всё: "+err.Error()))
+		}
 	case "two":
 		p := getPrefs(m.Chat.ID)
 		p.Cols, p.Page = 2, 0
@@ -210,7 +243,38 @@ func (b *Bot) onCallback(cb *tgbotapi.CallbackQuery) {
 	switch {
 	case data == "noop":
 	// ничего, просто закрыть "часики"
+	case data == "all:not":
+		if p.DelMode {
+			break
+		} // в режиме удаления игнорим
 
+		// посчитаем, сколько реально изменится
+		cats, sel, _, _, _ := b.board.GetStateSnapshot()
+		changed := 0
+		for _, c := range cats {
+			if !sel[c] { // было куплено, станет "в списке" (не куплено)
+				changed++
+			}
+		}
+
+		if err := b.store.SetAllSelected(true); err != nil {
+			log.Printf("all:not: %v", err)
+			break
+		}
+		// синхронизируем память и разошлём
+		b.board.SetAllSelected(true)
+
+		// агрегированная запись в журнал — одной строкой
+		_ = b.store.AppendJournal(store.JournalEntry{
+			TS:       time.Now(),
+			ChatID:   cid,
+			User:     atName(cb.From),
+			Category: fmt.Sprintf("ALL → ☐ (+%d)", changed),
+			From:     false, // формально "смешанное", но отображаем как сводную стрелку
+			To:       true,
+		})
+
+		b.scheduleBroadcast()
 	case data == "backup:now":
 		if isAdminChat {
 			go b.doBackup() // не блокируем UI, шлём экспорт и файл в админ-чат
@@ -655,6 +719,7 @@ func (b *Bot) render(chatID int64) (string, tgbotapi.InlineKeyboardMarkup) {
 	act := []tgbotapi.InlineKeyboardButton{addBtn}
 	// Кнопка экспорта и журнала всегда доступны
 	act = append(act,
+		tgbotapi.NewInlineKeyboardButtonData("☐ Всё", "all:not"),
 		tgbotapi.NewInlineKeyboardButtonData("📤 Экспорт", "exp:cur"),
 		tgbotapi.NewInlineKeyboardButtonData("📜 Журнал", "log:show"),
 	)
