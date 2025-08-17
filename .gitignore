@@ -1,0 +1,6 @@
+tradelistbot
+.idea
+.vscode
+*.db
+*.db*
+buildandrun.sh
