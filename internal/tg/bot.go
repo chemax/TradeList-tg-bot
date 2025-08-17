@@ -141,7 +141,11 @@ func (b *Bot) onMessage(m *tgbotapi.Message) {
 	switch m.Command() {
 	case "start":
 		b.sendOrEditForChat(m.Chat.ID)
-
+	case "backup":
+		if m.Chat != nil && b.cfg.AdminChatID != 0 && m.Chat.ID == b.cfg.AdminChatID {
+			go b.doBackup()
+			_, _ = b.api.Send(tgbotapi.NewMessage(m.Chat.ID, "Запускаю бэкап…"))
+		}
 	case "two":
 		p := getPrefs(m.Chat.ID)
 		p.Cols, p.Page = 2, 0
@@ -205,8 +209,12 @@ func (b *Bot) onCallback(cb *tgbotapi.CallbackQuery) {
 
 	switch {
 	case data == "noop":
-		// ничего, просто закрыть "часики"
+	// ничего, просто закрыть "часики"
 
+	case data == "backup:now":
+		if isAdminChat {
+			go b.doBackup() // не блокируем UI, шлём экспорт и файл в админ-чат
+		}
 	// ----- Быстрое удаление (только админ-чат) -----
 	case data == "delmode:toggle":
 		if !isAdminChat {
@@ -653,6 +661,7 @@ func (b *Bot) render(chatID int64) (string, tgbotapi.InlineKeyboardMarkup) {
 	// Админская кнопка «🗑 Удалить» — только в админ-чате
 	if isAdminChat {
 		act = append(act, tgbotapi.NewInlineKeyboardButtonData("🗑 Удалить", "delmode:toggle"))
+		act = append(act, tgbotapi.NewInlineKeyboardButtonData("💾 Бэкап", "backup:now"))
 	}
 	rows = append(rows, act)
 
