@@ -33,13 +33,10 @@ func New(path string) (*Store, error) {
 func (s *Store) Close() error { return s.db.Close() }
 
 func (s *Store) init() error {
-	// Включаем внешние ключи на новых БД
 	if _, err := s.db.Exec(`PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL;`); err != nil {
 		return err
 	}
-
-	// Таблицы
-	if _, err := s.db.Exec(`
+	_, err := s.db.Exec(`
 CREATE TABLE IF NOT EXISTS categories (
   name TEXT PRIMARY KEY,
   ord  INTEGER NOT NULL
@@ -60,11 +57,8 @@ CREATE TABLE IF NOT EXISTS journal (
   from_on  INTEGER NOT NULL,
   to_on    INTEGER NOT NULL
 );
-`); err != nil {
-		return err
-	}
-
-	return nil
+`)
+	return err
 }
 
 // ---------- Settings ----------
@@ -165,14 +159,12 @@ func (s *Store) AddCategory(name string) error {
 	if stringsTrim(name) == "" {
 		return nil
 	}
-	// получим следующий ord
 	var maxOrd sql.NullInt64
 	_ = s.db.QueryRow(`SELECT MAX(ord) FROM categories`).Scan(&maxOrd)
 	next := 1
 	if maxOrd.Valid {
 		next = int(maxOrd.Int64) + 1
 	}
-	// вставим, игнорируя дубликаты
 	_, err := s.db.Exec(`INSERT OR IGNORE INTO categories(name, ord) VALUES(?,?)`, name, next)
 	return err
 }
@@ -181,7 +173,6 @@ func (s *Store) DeleteCategory(name string) error {
 	if stringsTrim(name) == "" {
 		return nil
 	}
-	// удалим из categories и зачистим selected
 	tx, err := s.db.Begin()
 	if err != nil {
 		return err
@@ -191,6 +182,78 @@ func (s *Store) DeleteCategory(name string) error {
 		return err
 	}
 	if _, err = tx.Exec(`DELETE FROM selected   WHERE category=?`, name); err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	return tx.Commit()
+}
+
+// MoveCategoryUp — поменять местами категорию с предыдущей по ord.
+func (s *Store) MoveCategoryUp(name string) error {
+	var curOrd int
+	err := s.db.QueryRow(`SELECT ord FROM categories WHERE name=?`, name).Scan(&curOrd)
+	if err != nil {
+		return err
+	}
+	var nbName string
+	var nbOrd int
+	// сосед сверху: ord < curOrd (наибольший из меньших)
+	err = s.db.QueryRow(`SELECT name, ord FROM categories WHERE ord < ? ORDER BY ord DESC LIMIT 1`, curOrd).Scan(&nbName, &nbOrd)
+	if err == sql.ErrNoRows {
+		return nil
+	} // уже самый верх
+	if err != nil {
+		return err
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	if _, err = tx.Exec(`UPDATE categories SET ord=-1 WHERE name=?`, name); err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	if _, err = tx.Exec(`UPDATE categories SET ord=? WHERE name=?`, curOrd, nbName); err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	if _, err = tx.Exec(`UPDATE categories SET ord=? WHERE name=?`, nbOrd, name); err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	return tx.Commit()
+}
+
+// MoveCategoryDown — поменять местами категорию со следующей по ord.
+func (s *Store) MoveCategoryDown(name string) error {
+	var curOrd int
+	err := s.db.QueryRow(`SELECT ord FROM categories WHERE name=?`, name).Scan(&curOrd)
+	if err != nil {
+		return err
+	}
+	var nbName string
+	var nbOrd int
+	// сосед снизу: ord > curOrd (наименьший из больших)
+	err = s.db.QueryRow(`SELECT name, ord FROM categories WHERE ord > ? ORDER BY ord ASC LIMIT 1`, curOrd).Scan(&nbName, &nbOrd)
+	if err == sql.ErrNoRows {
+		return nil
+	} // уже самый низ
+	if err != nil {
+		return err
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	if _, err = tx.Exec(`UPDATE categories SET ord=-1 WHERE name=?`, name); err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	if _, err = tx.Exec(`UPDATE categories SET ord=? WHERE name=?`, curOrd, nbName); err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	if _, err = tx.Exec(`UPDATE categories SET ord=? WHERE name=?`, nbOrd, name); err != nil {
 		_ = tx.Rollback()
 		return err
 	}
@@ -218,4 +281,29 @@ func stringsTrim(s string) string {
 		return ""
 	}
 	return s[i:j]
+}
+
+// MoveCategoryTop — поднять категорию в самый верх списка, сохранив относительный порядок остальных.
+// Делается атомарно: всем ord +1, целевой = 1.
+func (s *Store) MoveCategoryTop(name string) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	// сначала сдвигаем всех вниз
+	if _, err = tx.Exec(`UPDATE categories SET ord = ord + 1`); err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	// затем ставим выбранную категорию на верх
+	if res, err := tx.Exec(`UPDATE categories SET ord = 1 WHERE name = ?`, name); err != nil {
+		_ = tx.Rollback()
+		return err
+	} else {
+		if aff, _ := res.RowsAffected(); aff == 0 {
+			_ = tx.Rollback()
+			return sql.ErrNoRows
+		}
+	}
+	return tx.Commit()
 }
