@@ -16,7 +16,7 @@ import (
 
 type Config struct {
 	ChatIDs         []int64 // получатели рассылки
-	AdminChatID     int64   // чат для бэкапов (0 = выкл)
+	AdminChatID     int64   // чат для бэкапов и админ-режимов (0 = выкл)
 	BackupEveryDays int     // раз в N дней
 	DBPath          string  // путь к sqlite для отправки файла
 	SoftMaxRows     int     // «мягкий» предел строк до пагинации (до лимитов Telegram)
@@ -40,6 +40,8 @@ type prefs struct {
 	Cols        int  // 2, 3, 4
 	Page        int  // текущая страница
 	ReorderMode bool // режим упорядочивания
+	DelMode     bool // режим быстрого удаления (только для AdminChatID)
+	DelCand     string
 }
 
 var (
@@ -54,7 +56,7 @@ func getPrefs(chatID int64) *prefs {
 	if p != nil {
 		return p
 	}
-	p = &prefs{Cols: 2, Page: 0, ReorderMode: false}
+	p = &prefs{Cols: 2, Page: 0, ReorderMode: false, DelMode: false, DelCand: ""}
 	prefMu.Lock()
 	prefsByChat[chatID] = p
 	prefMu.Unlock()
@@ -105,6 +107,7 @@ func (b *Bot) Start() {
 		if s, _ := b.store.GetSetting(fmt.Sprintf("reorder:%d", cid), "0"); s != "" {
 			getPrefs(cid).ReorderMode = s == "1"
 		}
+		// DelMode не восстанавливаем — это временный режим, только из админ-чата по кнопке
 	}
 
 	// Глобальный фильтр (на всю доску)
@@ -197,22 +200,57 @@ func (b *Bot) onMessage(m *tgbotapi.Message) {
 func (b *Bot) onCallback(cb *tgbotapi.CallbackQuery) {
 	data := cb.Data
 	cid := cb.Message.Chat.ID
+	isAdminChat := (b.cfg.AdminChatID != 0 && cid == b.cfg.AdminChatID)
+	p := getPrefs(cid)
 
 	switch {
 	case data == "noop":
 		// ничего, просто закрыть "часики"
-	case strings.HasPrefix(data, "top:"):
-		cat := strings.TrimPrefix(data, "top:")
-		if err := b.store.MoveCategoryTop(cat); err != nil {
-			log.Printf("move top: %v", err)
+
+	// ----- Быстрое удаление (только админ-чат) -----
+	case data == "delmode:toggle":
+		if !isAdminChat {
+			break
+		}
+		p.DelMode = !p.DelMode
+		p.DelCand = ""
+		b.scheduleBroadcast()
+
+	case data == "del:clear":
+		if !isAdminChat || !p.DelMode {
+			break
+		}
+		p.DelCand = ""
+		b.scheduleBroadcast()
+
+	case strings.HasPrefix(data, "del:arm:"):
+		if !isAdminChat || !p.DelMode {
+			break
+		}
+		cat := strings.TrimPrefix(data, "del:arm:")
+		// армим выбранную категорию
+		p.DelCand = cat
+		b.scheduleBroadcast()
+
+	case strings.HasPrefix(data, "del:confirm:"):
+		if !isAdminChat || !p.DelMode {
+			break
+		}
+		cat := strings.TrimPrefix(data, "del:confirm:")
+		if err := b.store.DeleteCategory(cat); err != nil {
+			log.Printf("quick delete: %v", err)
 		}
 		if cats, err := b.store.ListCategories(); err == nil {
 			b.board.ReplaceCategories(cats)
 		}
+		// сбрасываем выбор, остаёмся в режиме удаления
+		p.DelCand = ""
 		b.scheduleBroadcast()
+
+	// ----- Обычный тумблер/колонки/фильтры/порядок -----
 	case strings.HasPrefix(data, "t:"):
-		// toggle (в обычном режиме)
-		if getPrefs(cid).ReorderMode {
+		// если включён режим удаления — игнорируем тумблеры
+		if p.DelMode {
 			break
 		}
 		cat := strings.TrimPrefix(data, "t:")
@@ -225,38 +263,53 @@ func (b *Bot) onCallback(cb *tgbotapi.CallbackQuery) {
 		b.scheduleBroadcast()
 
 	case strings.HasPrefix(data, "c:"):
+		if p.DelMode {
+			break
+		}
 		val := strings.TrimPrefix(data, "c:")
 		v, _ := strconv.Atoi(val)
 		if v < 2 || v > 4 {
 			v = 2
 		}
-		p := getPrefs(cid)
 		p.Cols, p.Page = v, 0
 		_ = b.store.SetSetting(fmt.Sprintf("cols:%d", cid), strconv.Itoa(v))
 		_ = b.store.SetSetting(fmt.Sprintf("page:%d", cid), "0")
 		b.scheduleBroadcast()
 
 	case strings.HasPrefix(data, "f:"):
+		if p.DelMode {
+			break
+		}
 		arg := strings.TrimPrefix(data, "f:")
 		b.applyFilterArg(arg)
 		b.scheduleBroadcast()
 
 	case data == "exp:cur":
+		if p.DelMode {
+			break
+		}
 		b.sendExport(cid)
 
 	case data == "log:show":
+		if p.DelMode {
+			break
+		}
 		b.sendJournal(cid, 50)
 
 	case data == "re:toggle":
-		p := getPrefs(cid)
+		if p.DelMode {
+			break
+		}
 		p.ReorderMode = !p.ReorderMode
 		_ = b.store.SetSetting(fmt.Sprintf("reorder:%d", cid), boolTo01(p.ReorderMode))
-		// Сбросить страницу при входе в режим
 		p.Page = 0
 		_ = b.store.SetSetting(fmt.Sprintf("page:%d", cid), "0")
 		b.scheduleBroadcast()
 
 	case strings.HasPrefix(data, "up:"):
+		if p.DelMode {
+			break
+		}
 		cat := strings.TrimPrefix(data, "up:")
 		if err := b.store.MoveCategoryUp(cat); err != nil {
 			log.Printf("move up: %v", err)
@@ -267,6 +320,9 @@ func (b *Bot) onCallback(cb *tgbotapi.CallbackQuery) {
 		b.scheduleBroadcast()
 
 	case strings.HasPrefix(data, "down:"):
+		if p.DelMode {
+			break
+		}
 		cat := strings.TrimPrefix(data, "down:")
 		if err := b.store.MoveCategoryDown(cat); err != nil {
 			log.Printf("move down: %v", err)
@@ -276,9 +332,21 @@ func (b *Bot) onCallback(cb *tgbotapi.CallbackQuery) {
 		}
 		b.scheduleBroadcast()
 
+	case strings.HasPrefix(data, "top:"):
+		if p.DelMode {
+			break
+		}
+		cat := strings.TrimPrefix(data, "top:")
+		if err := b.store.MoveCategoryTop(cat); err != nil {
+			log.Printf("move top: %v", err)
+		}
+		if cats, err := b.store.ListCategories(); err == nil {
+			b.board.ReplaceCategories(cats)
+		}
+		b.scheduleBroadcast()
+
 	case data == "p:prev":
-		p := getPrefs(cid)
-		total := b.totalPages(p.Cols, p.ReorderMode)
+		total := b.totalPages(p.Cols, p.ReorderMode || p.DelMode)
 		if total > 0 {
 			p.Page = (p.Page - 1 + total) % total
 			_ = b.store.SetSetting(fmt.Sprintf("page:%d", cid), strconv.Itoa(p.Page))
@@ -286,8 +354,7 @@ func (b *Bot) onCallback(cb *tgbotapi.CallbackQuery) {
 		}
 
 	case data == "p:next":
-		p := getPrefs(cid)
-		total := b.totalPages(p.Cols, p.ReorderMode)
+		total := b.totalPages(p.Cols, p.ReorderMode || p.DelMode)
 		if total > 0 {
 			p.Page = (p.Page + 1) % total
 			_ = b.store.SetSetting(fmt.Sprintf("page:%d", cid), strconv.Itoa(p.Page))
@@ -310,15 +377,9 @@ func (b *Bot) onInlineQuery(q *tgbotapi.InlineQuery) {
 		_, _ = b.api.Request(cfg)
 		return
 	}
-
 	title := fmt.Sprintf("Добавить категорию «%s»", query)
-
-	// В твоей версии NewInlineQueryResultArticle ждёт строку messageText:
 	res := tgbotapi.NewInlineQueryResultArticle("add-"+q.ID, title, "/addcat "+query)
 	res.Description = "Отправит команду /addcat в этот чат"
-	// При желании можно добавить превью-ссылку/иконку:
-	// res.ThumbURL = "https://..."
-	// res.URL = "tg://resolve?..." (без фанатизма)
 
 	cfg := tgbotapi.InlineConfig{
 		InlineQueryID: q.ID,
@@ -416,11 +477,19 @@ func (b *Bot) broadcast() {
 }
 
 func (b *Bot) render(chatID int64) (string, tgbotapi.InlineKeyboardMarkup) {
-	_, sel, _, f, _ := b.board.GetStateSnapshot()
+	cats, sel, _, f, _ := b.board.GetStateSnapshot()
 	vis := b.board.Visible()
 
 	p := getPrefs(chatID)
-	cols, page, reorder := p.Cols, p.Page, p.ReorderMode
+	cols, page := p.Cols, p.Page
+	reorder := p.ReorderMode
+	delmode := p.DelMode
+	isAdminChat := (b.cfg.AdminChatID != 0 && chatID == b.cfg.AdminChatID)
+
+	// режим удаления: список всегда полный, без фильтрации (чтобы ничего не спрятать)
+	if delmode {
+		vis = append([]string(nil), cats...)
+	}
 
 	// пагинация «по необходимости»
 	maxRows := b.cfg.SoftMaxRows
@@ -429,7 +498,7 @@ func (b *Bot) render(chatID int64) (string, tgbotapi.InlineKeyboardMarkup) {
 	}
 
 	perPage := cols * maxRows
-	if reorder { // в режиме порядка — одна категория = одна строка
+	if reorder || delmode { // одна категория = одна строка
 		perPage = maxRows
 	}
 
@@ -461,13 +530,16 @@ func (b *Bot) render(chatID int64) (string, tgbotapi.InlineKeyboardMarkup) {
 	if reorder {
 		modeTxt = " • Режим: ↕️ Порядок"
 	}
+	if delmode {
+		modeTxt = " • Режим: 🗑 Удаление (только админ)"
+	}
 	summary := b.board.SummaryLine()
 
 	var bld strings.Builder
 	fmt.Fprintf(&bld, "%s\n%s\nФильтр: %s%s\n\n", title, summary, filterTxt, modeTxt)
 	if len(vis) == 0 {
 		bld.WriteString("— (пусто)")
-	} else {
+	} else if !delmode {
 		for _, c := range vis {
 			if sel[c] {
 				bld.WriteString("• ☐ ")
@@ -477,11 +549,50 @@ func (b *Bot) render(chatID int64) (string, tgbotapi.InlineKeyboardMarkup) {
 			bld.WriteString(c)
 			bld.WriteString("\n")
 		}
+	} else {
+		for _, c := range vis {
+			bld.WriteString("• ")
+			bld.WriteString(c)
+			bld.WriteString("\n")
+		}
 	}
 	text := bld.String()
 
 	// клавиатура
 	var rows [][]tgbotapi.InlineKeyboardButton
+
+	if delmode {
+		// режим быстрое удаление
+		for _, c := range vis {
+			if p.DelCand == c {
+				btn := tgbotapi.NewInlineKeyboardButtonData("❗Подтвердить: "+c, "del:confirm:"+c)
+				rows = append(rows, []tgbotapi.InlineKeyboardButton{btn})
+			} else {
+				btn := tgbotapi.NewInlineKeyboardButtonData("✖ "+c, "del:arm:"+c)
+				rows = append(rows, []tgbotapi.InlineKeyboardButton{btn})
+			}
+		}
+		// футер админ-режима
+		foot := []tgbotapi.InlineKeyboardButton{
+			tgbotapi.NewInlineKeyboardButtonData("↩️ Назад", "delmode:toggle"),
+		}
+		if p.DelCand != "" {
+			foot = append(foot, tgbotapi.NewInlineKeyboardButtonData("Отмена выбора", "del:clear"))
+		}
+		rows = append(rows, foot)
+
+		// пагинация (если нужна)
+		pages := b.totalPages(cols, true)
+		if pages > 1 {
+			pg := []tgbotapi.InlineKeyboardButton{
+				tgbotapi.NewInlineKeyboardButtonData(fmt.Sprintf("◀️ %d/%d", page+1, pages), "p:prev"),
+				tgbotapi.NewInlineKeyboardButtonData("▶️", "p:next"),
+			}
+			rows = append(rows, pg)
+		}
+
+		return text, tgbotapi.NewInlineKeyboardMarkup(rows...)
+	}
 
 	if !reorder {
 		// обычный режим: тумблеры (2/3/4 колонки)
@@ -501,10 +612,10 @@ func (b *Bot) render(chatID int64) (string, tgbotapi.InlineKeyboardMarkup) {
 			rows = append(rows, row)
 		}
 	} else {
-		// режим порядка: на строке — ⬆️  «≡ Cat»  ⬇️
+		// режим порядка: ⬆️  «≡ Cat»  ⬇️
 		for _, c := range vis {
 			up := tgbotapi.NewInlineKeyboardButtonData("⬆️", "up:"+c)
-			center := tgbotapi.NewInlineKeyboardButtonData("≡ "+c, "top:"+c)
+			center := tgbotapi.NewInlineKeyboardButtonData("≡ "+c, "top:"+c) // клик по названию -> вверх
 			down := tgbotapi.NewInlineKeyboardButtonData("⬇️", "down:"+c)
 			rows = append(rows, []tgbotapi.InlineKeyboardButton{up, center, down})
 		}
@@ -520,7 +631,7 @@ func (b *Bot) render(chatID int64) (string, tgbotapi.InlineKeyboardMarkup) {
 		rows = append(rows, ctrl)
 	}
 
-	// футер: фильтры (общие)
+	// футер: фильтры
 	fRow := []tgbotapi.InlineKeyboardButton{
 		tgbotapi.NewInlineKeyboardButtonData("Все", "f:all"),
 		tgbotapi.NewInlineKeyboardButtonData("☐ Не куплено", "f:not"),
@@ -529,19 +640,23 @@ func (b *Bot) render(chatID int64) (string, tgbotapi.InlineKeyboardMarkup) {
 	rows = append(rows, fRow)
 
 	// футер: действия
-	// ➕ Категория — inline-режим в текущем чате (SwitchInlineQueryCurrentChat: "")
 	addBtn := tgbotapi.InlineKeyboardButton{Text: "➕ Категория"}
 	empty := ""
 	addBtn.SwitchInlineQueryCurrentChat = &empty
 
-	act := []tgbotapi.InlineKeyboardButton{
-		addBtn,
+	act := []tgbotapi.InlineKeyboardButton{addBtn}
+	// Кнопка экспорта и журнала всегда доступны
+	act = append(act,
 		tgbotapi.NewInlineKeyboardButtonData("📤 Экспорт", "exp:cur"),
 		tgbotapi.NewInlineKeyboardButtonData("📜 Журнал", "log:show"),
+	)
+	// Админская кнопка «🗑 Удалить» — только в админ-чате
+	if isAdminChat {
+		act = append(act, tgbotapi.NewInlineKeyboardButtonData("🗑 Удалить", "delmode:toggle"))
 	}
 	rows = append(rows, act)
 
-	// футер: переключение режима порядка
+	// футер: режим порядка
 	reBtnText := "↕️ Порядок"
 	if reorder {
 		reBtnText = "✅ Готово"
@@ -583,6 +698,7 @@ func (b *Bot) sendJournal(chatID int64, limit int) {
 		_, _ = b.api.Send(tgbotapi.NewMessage(chatID, "Журнал пуст."))
 		return
 	}
+
 	var sb strings.Builder
 	sb.WriteString("```text\n")
 	for i := range entries {
@@ -596,23 +712,30 @@ func (b *Bot) sendJournal(chatID int64, limit int) {
 		if e.To {
 			to = "☐"
 		}
-		sb.WriteString(fmt.Sprintf("%s  %-16s  %s → %s  (%d)\n",
-			e.TS.Format("2006-01-02 15:04"), e.User, from, to, e.ChatID))
+
+		// Добавили [Категория]
+		sb.WriteString(fmt.Sprintf("%s  %s  [%s]  %s → %s  \n",
+			e.TS.Format("2006-01-02 15:04"),
+			e.User,
+			e.Category,
+			from, to,
+		))
 	}
 	sb.WriteString("```")
+
 	msg := tgbotapi.NewMessage(chatID, sb.String())
 	msg.ParseMode = "Markdown"
 	_, _ = b.api.Send(msg)
 }
 
-func (b *Bot) totalPages(cols int, reorder bool) int {
+func (b *Bot) totalPages(cols int, singleRow bool) int {
 	vis := b.board.Visible()
 	maxRows := b.cfg.SoftMaxRows
 	if maxRows <= 0 {
 		maxRows = 12
 	}
 	perPage := cols * maxRows
-	if reorder {
+	if singleRow {
 		perPage = maxRows
 	}
 	if len(vis) <= perPage {
@@ -668,12 +791,6 @@ func atName(u *tgbotapi.User) string {
 }
 
 func strPtr(s string) *string { return &s }
-func boolTo01(b bool) string {
-	if b {
-		return "1"
-	}
-	return "0"
-}
 
 // --- вспомогательные для add/del категорий ---
 func (b *Bot) addCategoriesFromText(s string) int {
@@ -690,7 +807,6 @@ func (b *Bot) addCategoriesFromText(s string) int {
 			cnt++
 		}
 	}
-	// перечитать список и обновить доску
 	if cats, err := b.store.ListCategories(); err == nil {
 		b.board.ReplaceCategories(cats)
 		b.scheduleBroadcast()
@@ -735,4 +851,11 @@ func splitCats(s string) []string {
 		}
 	}
 	return out
+}
+
+func boolTo01(b bool) string {
+	if b {
+		return "1"
+	}
+	return "0"
 }
