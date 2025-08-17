@@ -39,7 +39,7 @@ type Bot struct {
 
 // ---- пер-чат настройки отображения ----
 type prefs struct {
-	Cols int // 2 или 3
+	Cols int // 2, 3 или 4
 	Page int // текущая страница
 }
 
@@ -89,7 +89,7 @@ func (b *Bot) Start() {
 	// Поднять пер-чат настройки (cols/page) для известных получателей
 	for _, cid := range b.cfg.ChatIDs {
 		if s, _ := b.store.GetSetting(fmt.Sprintf("cols:%d", cid), "2"); s != "" {
-			if v, err := strconv.Atoi(s); err == nil && (v == 2 || v == 3) {
+			if v, err := strconv.Atoi(s); err == nil && v >= 2 && v <= 4 {
 				getPrefs(cid).Cols = v
 			}
 		}
@@ -134,12 +134,24 @@ func (b *Bot) onMessage(m *tgbotapi.Message) {
 		p := getPrefs(m.Chat.ID)
 		p.Cols = 2
 		_ = b.store.SetSetting(fmt.Sprintf("cols:%d", m.Chat.ID), "2")
+		p.Page = 0
+		_ = b.store.SetSetting(fmt.Sprintf("page:%d", m.Chat.ID), "0")
 		b.scheduleBroadcast()
 
 	case "three":
 		p := getPrefs(m.Chat.ID)
 		p.Cols = 3
 		_ = b.store.SetSetting(fmt.Sprintf("cols:%d", m.Chat.ID), "3")
+		p.Page = 0
+		_ = b.store.SetSetting(fmt.Sprintf("page:%d", m.Chat.ID), "0")
+		b.scheduleBroadcast()
+
+	case "four":
+		p := getPrefs(m.Chat.ID)
+		p.Cols = 4
+		_ = b.store.SetSetting(fmt.Sprintf("cols:%d", m.Chat.ID), "4")
+		p.Page = 0
+		_ = b.store.SetSetting(fmt.Sprintf("page:%d", m.Chat.ID), "0")
 		b.scheduleBroadcast()
 
 	case "filter":
@@ -174,14 +186,14 @@ func (b *Bot) onCallback(cb *tgbotapi.CallbackQuery) {
 		b.scheduleBroadcast()
 
 	case strings.HasPrefix(data, "c:"):
-		p := getPrefs(cid)
-		if strings.HasSuffix(data, "2") {
-			p.Cols = 2
-			_ = b.store.SetSetting(fmt.Sprintf("cols:%d", cid), "2")
-		} else {
-			p.Cols = 3
-			_ = b.store.SetSetting(fmt.Sprintf("cols:%d", cid), "3")
+		val := strings.TrimPrefix(data, "c:")
+		v, _ := strconv.Atoi(val)
+		if v < 2 || v > 4 {
+			v = 2
 		}
+		p := getPrefs(cid)
+		p.Cols = v
+		_ = b.store.SetSetting(fmt.Sprintf("cols:%d", cid), strconv.Itoa(v))
 		// При смене колонок корректнее сбросить страницу
 		p.Page = 0
 		_ = b.store.SetSetting(fmt.Sprintf("page:%d", cid), "0")
@@ -380,10 +392,11 @@ func (b *Bot) render(chatID int64) (string, tgbotapi.InlineKeyboardMarkup) {
 		rows = append(rows, row)
 	}
 
-	// футер: колонки
+	// футер: колонки (2 / 3 / 4)
 	ctrl := []tgbotapi.InlineKeyboardButton{
 		tgbotapi.NewInlineKeyboardButtonData("2 колонки", "c:2"),
 		tgbotapi.NewInlineKeyboardButtonData("3 колонки", "c:3"),
+		tgbotapi.NewInlineKeyboardButtonData("4 колонки", "c:4"),
 	}
 	rows = append(rows, ctrl)
 
@@ -438,15 +451,15 @@ func (b *Bot) sendJournal(chatID int64, limit int) {
 	sb.WriteString("```text\n")
 	for i := range entries {
 		e := entries[i]
-		from := "☐"
+		// true = в списке (не куплено) => ☐ ; false = куплено => ✅
+		from := "✅"
 		if e.From {
-			from = "✅" // из купленного — в чекбокс? нет, у нас бинарная логика "в списке"/"куплено"; журнал просто показывает переход
+			from = "☐"
 		}
-		to := "☐"
+		to := "✅"
 		if e.To {
-			to = "✅"
+			to = "☐"
 		}
-		// ts  user  from->to  (chatID)
 		sb.WriteString(fmt.Sprintf("%s  %-16s  %s → %s  (%d)\n",
 			e.TS.Format("2006-01-02 15:04"), e.User, from, to, e.ChatID))
 	}

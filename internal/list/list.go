@@ -10,8 +10,8 @@ type Filter int
 
 const (
 	FilterAll       Filter = iota
-	FilterNotBought        // «в списке» (не куплено) — отображаем ☐
-	FilterBought           // «куплено» — отображаем ✅
+	FilterNotBought        // «в списке» (не куплено) — ☐
+	FilterBought           // «куплено» — ✅
 )
 
 type Board struct {
@@ -29,9 +29,50 @@ func NewBoard(categories []string) *Board {
 	}
 }
 
+// Полная замена категорий (например, после изменения в БД)
+func (b *Board) ReplaceCategories(cats []string) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	// заменить список
+	b.Categories = append([]string(nil), cats...)
+	// зачистить Selected от несуществующих
+	set := make(map[string]struct{}, len(cats))
+	for _, c := range cats {
+		set[c] = struct{}{}
+	}
+	for k := range b.Selected {
+		if _, ok := set[k]; !ok {
+			delete(b.Selected, k)
+		}
+	}
+}
+
+func (b *Board) HasCategory(cat string) bool {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	for _, c := range b.Categories {
+		if c == cat {
+			return true
+		}
+	}
+	return false
+}
+
 func (b *Board) Toggle(cat string) (from, to bool) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	// игнор, если категории нет (например, кнопка из старого сообщения)
+	found := false
+	for _, c := range b.Categories {
+		if c == cat {
+			found = true
+			break
+		}
+	}
+	if !found {
+		return false, false
+	}
+
 	from = b.Selected[cat]
 	if from {
 		delete(b.Selected, cat)
@@ -50,7 +91,6 @@ func (b *Board) SetFilter(f Filter) {
 }
 
 func (b *Board) GetStateSnapshot() (cats []string, sel map[string]bool, cols int, f Filter, page int) {
-	// cols/page не используются в домене — оставлены для совместимости сигнатуры
 	b.mu.RLock()
 	defer b.mu.RUnlock()
 	return append([]string(nil), b.Categories...), copyMap(b.Selected), 0, b.Filter, 0
@@ -80,14 +120,14 @@ func (b *Board) Visible() []string {
 	return out
 }
 
-// ExportLines — экспорт ВСЕГО списка: [x] куплено, [] не куплено.
+// Экспорт ВСЕГО списка: [x] куплено, [] не куплено.
 func (b *Board) ExportLines() []string {
 	cats, sel, _, _, _ := b.GetStateSnapshot()
 	lines := make([]string, 0, len(cats))
 	for _, c := range cats {
-		if sel[c] { // в списке (не куплено)
+		if sel[c] {
 			lines = append(lines, "[] "+c)
-		} else { // куплено
+		} else {
 			lines = append(lines, "[x] "+c)
 		}
 	}
@@ -115,6 +155,4 @@ func copyMap(m map[string]bool) map[string]bool {
 	return cp
 }
 
-func JoinLines(lines []string) string {
-	return strings.Join(lines, "\n")
-}
+func JoinLines(lines []string) string { return strings.Join(lines, "\n") }

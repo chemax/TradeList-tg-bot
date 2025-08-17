@@ -33,8 +33,17 @@ func New(path string) (*Store, error) {
 func (s *Store) Close() error { return s.db.Close() }
 
 func (s *Store) init() error {
-	_, err := s.db.Exec(`
-PRAGMA journal_mode=WAL;
+	// Включаем внешние ключи на новых БД
+	if _, err := s.db.Exec(`PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL;`); err != nil {
+		return err
+	}
+
+	// Таблицы
+	if _, err := s.db.Exec(`
+CREATE TABLE IF NOT EXISTS categories (
+  name TEXT PRIMARY KEY,
+  ord  INTEGER NOT NULL
+);
 CREATE TABLE IF NOT EXISTS selected (
   category TEXT PRIMARY KEY,
   is_on    INTEGER NOT NULL
@@ -51,12 +60,14 @@ CREATE TABLE IF NOT EXISTS journal (
   from_on  INTEGER NOT NULL,
   to_on    INTEGER NOT NULL
 );
-`)
-	return err
+`); err != nil {
+		return err
+	}
+
+	return nil
 }
 
 // ---------- Settings ----------
-
 func (s *Store) GetSetting(key string, def string) (string, error) {
 	var val string
 	err := s.db.QueryRow(`SELECT value FROM settings WHERE key=?`, key).Scan(&val)
@@ -65,7 +76,6 @@ func (s *Store) GetSetting(key string, def string) (string, error) {
 	}
 	return val, err
 }
-
 func (s *Store) SetSetting(key, val string) error {
 	_, err := s.db.Exec(`INSERT INTO settings(key,value) VALUES(?,?)
 	                 ON CONFLICT(key) DO UPDATE SET value=excluded.value`, key, val)
@@ -73,7 +83,6 @@ func (s *Store) SetSetting(key, val string) error {
 }
 
 // ---------- Selected ----------
-
 func (s *Store) LoadSelected() (map[string]bool, error) {
 	rows, err := s.db.Query(`SELECT category, is_on FROM selected`)
 	if err != nil {
@@ -91,7 +100,6 @@ func (s *Store) LoadSelected() (map[string]bool, error) {
 	}
 	return out, rows.Err()
 }
-
 func (s *Store) SetSelected(cat string, on bool) error {
 	val := 0
 	if on {
@@ -103,14 +111,12 @@ func (s *Store) SetSelected(cat string, on bool) error {
 }
 
 // ---------- Journal ----------
-
 func (s *Store) AppendJournal(e JournalEntry) error {
 	_, err := s.db.Exec(`INSERT INTO journal(ts,chat_id,user,category,from_on,to_on)
 	                     VALUES(?,?,?,?,?,?)`,
 		e.TS.Unix(), e.ChatID, e.User, e.Category, b2i(e.From), b2i(e.To))
 	return err
 }
-
 func (s *Store) LastJournal(limit int) ([]JournalEntry, error) {
 	if limit <= 0 {
 		limit = 50
@@ -137,9 +143,79 @@ func (s *Store) LastJournal(limit int) ([]JournalEntry, error) {
 	return out, rows.Err()
 }
 
+// ---------- Categories ----------
+func (s *Store) ListCategories() ([]string, error) {
+	rows, err := s.db.Query(`SELECT name FROM categories ORDER BY ord ASC`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var n string
+		if err := rows.Scan(&n); err != nil {
+			return nil, err
+		}
+		out = append(out, n)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) AddCategory(name string) error {
+	if stringsTrim(name) == "" {
+		return nil
+	}
+	// получим следующий ord
+	var maxOrd sql.NullInt64
+	_ = s.db.QueryRow(`SELECT MAX(ord) FROM categories`).Scan(&maxOrd)
+	next := 1
+	if maxOrd.Valid {
+		next = int(maxOrd.Int64) + 1
+	}
+	// вставим, игнорируя дубликаты
+	_, err := s.db.Exec(`INSERT OR IGNORE INTO categories(name, ord) VALUES(?,?)`, name, next)
+	return err
+}
+
+func (s *Store) DeleteCategory(name string) error {
+	if stringsTrim(name) == "" {
+		return nil
+	}
+	// удалим из categories и зачистим selected
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	if _, err = tx.Exec(`DELETE FROM categories WHERE name=?`, name); err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	if _, err = tx.Exec(`DELETE FROM selected   WHERE category=?`, name); err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	return tx.Commit()
+}
+
 func b2i(b bool) int {
 	if b {
 		return 1
 	}
 	return 0
+}
+
+// small helper to avoid importing strings everywhere
+func stringsTrim(s string) string {
+	i := 0
+	j := len(s)
+	for i < j && (s[i] == ' ' || s[i] == '\t' || s[i] == '\n' || s[i] == '\r') {
+		i++
+	}
+	for i < j && (s[j-1] == ' ' || s[j-1] == '\t' || s[j-1] == '\n' || s[j-1] == '\r') {
+		j--
+	}
+	if i >= j {
+		return ""
+	}
+	return s[i:j]
 }
