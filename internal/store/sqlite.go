@@ -57,6 +57,11 @@ CREATE TABLE IF NOT EXISTS journal (
   from_on  INTEGER NOT NULL,
   to_on    INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS notification_schedule (
+  user_id       INTEGER PRIMARY KEY,
+  minute_of_day INTEGER, -- 0..1430, шаг 30; NULL => отключено
+  updated_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%d %H:%M:%S','now'))
+);
 `)
 	return err
 }

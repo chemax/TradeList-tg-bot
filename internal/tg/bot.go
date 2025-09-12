@@ -49,6 +49,7 @@ type prefs struct {
 	DelMode     bool // режим быстрого удаления (только AdminChatID)
 	DelCand     string
 	MenuOpen    bool // подменю открыто
+	RemindersOpen bool // экран настройки напоминаний открыт
 	Rows        int  // максимум строк на страницу (пер-чат)
 }
 
@@ -261,6 +262,18 @@ func (b *Bot) onCallback(cb *tgbotapi.CallbackQuery) {
 	p := getPrefs(cid)
 
 	switch {
+	case data == "rem:open":
+		p.RemindersOpen = true
+		b.scheduleBroadcast()
+
+	case data == "rem:back":
+		p.RemindersOpen = false
+		b.scheduleBroadcast()
+
+	case strings.HasPrefix(data, "rem:h:") || data == "rem:m:00" || data == "rem:m:30" || data == "rem:disable":
+		// Заглушки: пока без логики
+		_, _ = b.api.Send(tgbotapi.NewMessage(cid, "Настройки напоминаний скоро будут доступны."))
+
 	case data == "noop":
 		// ничего, просто закрыть "часики"
 
@@ -786,6 +799,36 @@ func (b *Bot) render(chatID int64) (string, tgbotapi.InlineKeyboardMarkup) {
 		// заголовок подменю: Назад
 		rows = append(rows, []tgbotapi.InlineKeyboardButton{
 			tgbotapi.NewInlineKeyboardButtonData("⬅️ Назад", "menu:close"),
+
+		// Экран "Настройка напоминаний"
+		if p.RemindersOpen {
+			// 24 кнопки часов (00..23), по 6 в строке
+			{
+				row := make([]tgbotapi.InlineKeyboardButton, 0, 6)
+				for h := 0; h < 24; h++ {
+					row = append(row, tgbotapi.NewInlineKeyboardButtonData(fmt.Sprintf("%02d", h), fmt.Sprintf("rem:h:%02d", h)))
+					if len(row) == 6 {
+						rows = append(rows, row)
+						row = make([]tgbotapi.InlineKeyboardButton, 0, 6)
+					}
+				}
+				if len(row) > 0 { rows = append(rows, row) }
+			}
+			// Минуты
+			rows = append(rows, []tgbotapi.InlineKeyboardButton{
+				tgbotapi.NewInlineKeyboardButtonData(":00", "rem:m:00"),
+				tgbotapi.NewInlineKeyboardButtonData(":30", "rem:m:30"),
+			})
+			// Отключить
+			rows = append(rows, []tgbotapi.InlineKeyboardButton{
+				tgbotapi.NewInlineKeyboardButtonData("отключить напоминания", "rem:disable"),
+			})
+			// Вернуться в меню
+			rows = append(rows, []tgbotapi.InlineKeyboardButton{
+				tgbotapi.NewInlineKeyboardButtonData("вернуться в меню", "rem:back"),
+			})
+			return text, tgbotapi.NewInlineKeyboardMarkup(rows...)
+		}
 		})
 
 		// Фильтры
@@ -800,6 +843,11 @@ func (b *Bot) render(chatID int64) (string, tgbotapi.InlineKeyboardMarkup) {
 			tgbotapi.NewInlineKeyboardButtonData("2 колонки", "c:2"),
 			tgbotapi.NewInlineKeyboardButtonData("3 колонки", "c:3"),
 			tgbotapi.NewInlineKeyboardButtonData("4 колонки", "c:4"),
+
+		// Настройка напоминаний
+		rows = append(rows, []tgbotapi.InlineKeyboardButton{
+			tgbotapi.NewInlineKeyboardButtonData("Настройка напоминаний", "rem:open"),
+		})
 		})
 
 		// Строки: −8 / текущие / +8
@@ -1053,3 +1101,4 @@ func splitCats(s string) []string {
 	}
 	return out
 }
+		RemindersOpen: false,
