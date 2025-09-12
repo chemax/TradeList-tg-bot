@@ -51,6 +51,7 @@ type prefs struct {
 	MenuOpen      bool // подменю открыто
 	RemindersOpen bool // экран настройки напоминаний открыт
 	Rows          int  // максимум строк на страницу (пер-чат)
+	RemHour       int  // выбранный час для напоминаний (−1 = не выбран)
 }
 
 var (
@@ -74,6 +75,7 @@ func getPrefs(chatID int64) *prefs {
 		MenuOpen:      false,
 		RemindersOpen: false,
 		Rows:          0,
+		RemHour:       -1,
 	}
 
 	prefMu.Lock()
@@ -272,9 +274,49 @@ func (b *Bot) onCallback(cb *tgbotapi.CallbackQuery) {
 		p.RemindersOpen = false
 		b.scheduleBroadcast()
 
-	case strings.HasPrefix(data, "rem:h:") || data == "rem:m:00" || data == "rem:m:30" || data == "rem:disable":
-		// Заглушки: пока без логики
-		_, _ = b.api.Send(tgbotapi.NewMessage(cid, "Настройки напоминаний скоро будут доступны."))
+	case strings.HasPrefix(data, "rem:h:"):
+		// Час выбран ⇒ сразу сохраняем HH:00
+		hh := strings.TrimPrefix(data, "rem:h:")
+		if len(hh) >= 2 {
+			if h, err := strconv.Atoi(hh[:2]); err == nil && h >= 0 && h <= 23 {
+				p.RemHour = h
+				val := h*60 + 0
+				if err := b.store.SetNotification(cb.From.ID, &val); err == nil {
+					_, _ = b.api.Send(tgbotapi.NewMessage(cid,
+						fmt.Sprintf("⏰ Напоминание установлено на %02d:00 (сервер).", h)))
+				} else {
+					_, _ = b.api.Send(tgbotapi.NewMessage(cid, "Не удалось сохранить напоминание."))
+				}
+				b.scheduleBroadcast()
+			}
+		}
+
+	case data == "rem:m:00", data == "rem:m:30":
+		// Минуты применяются к последнему выбранному часу
+		if p.RemHour >= 0 && p.RemHour <= 23 {
+			minute := 0
+			if data == "rem:m:30" {
+				minute = 30
+			}
+			val := p.RemHour*60 + minute
+			if err := b.store.SetNotification(cb.From.ID, &val); err == nil {
+				_, _ = b.api.Send(tgbotapi.NewMessage(cid,
+					fmt.Sprintf("⏰ Напоминание установлено на %02d:%02d (сервер).", p.RemHour, minute)))
+			} else {
+				_, _ = b.api.Send(tgbotapi.NewMessage(cid, "Не удалось сохранить напоминание."))
+			}
+			b.scheduleBroadcast()
+		} else {
+			_, _ = b.api.Send(tgbotapi.NewMessage(cid, "Сначала выберите час."))
+		}
+
+	case data == "rem:disable":
+		if err := b.store.SetNotification(cb.From.ID, nil); err == nil {
+			_, _ = b.api.Send(tgbotapi.NewMessage(cid, "🔕 Напоминания отключены."))
+		} else {
+			_, _ = b.api.Send(tgbotapi.NewMessage(cid, "Не удалось отключить напоминания."))
+		}
+		b.scheduleBroadcast()
 
 	case data == "noop":
 		// ничего, просто закрыть "часики"
@@ -836,6 +878,9 @@ func (b *Bot) render(chatID int64) (string, tgbotapi.InlineKeyboardMarkup) {
 			rows = append(rows, []tgbotapi.InlineKeyboardButton{
 				tgbotapi.NewInlineKeyboardButtonData("вернуться в меню", "rem:back"),
 			})
+
+			// Переопределим заголовок вместо списка покупок:
+			text = "Настройка напоминаний (серверное время)"
 			return text, tgbotapi.NewInlineKeyboardMarkup(rows...)
 		}
 

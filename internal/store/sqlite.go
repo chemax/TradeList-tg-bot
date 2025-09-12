@@ -349,3 +349,35 @@ func (s *Store) SetAllSelected(on bool) error {
 
 	return tx.Commit()
 }
+
+// ----------- Notification schedule -----------
+
+// SetNotification upserts user's minute_of_day (0..1430, step 30).
+// If minuteOfDay == nil, it disables notifications (NULL).
+func (s *Store) SetNotification(userID int64, minuteOfDay *int) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	if minuteOfDay == nil {
+		_, err = tx.Exec(`
+			INSERT INTO notification_schedule(user_id, minute_of_day) VALUES(?, NULL)
+			ON CONFLICT(user_id) DO UPDATE
+			SET minute_of_day=NULL,
+			    updated_at=strftime('%Y-%m-%d %H:%M:%S','now')
+		`, userID)
+	} else {
+		_, err = tx.Exec(`
+			INSERT INTO notification_schedule(user_id, minute_of_day) VALUES(?, ?)
+			ON CONFLICT(user_id) DO UPDATE
+			SET minute_of_day=excluded.minute_of_day,
+			    updated_at=strftime('%Y-%m-%d %H:%M:%S','now')
+		`, userID, *minuteOfDay)
+	}
+	if err != nil {
+		return err
+	}
+	return tx.Commit()
+}
