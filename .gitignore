@@ -4,3 +4,4 @@ tradelistbot
 *.db
 *.db*
 buildandrun.sh
+buildandrun.bat
