@@ -29,7 +29,7 @@ func NewBoard(categories []string) *Board {
 	}
 }
 
-// Полная замена категорий (например, после изменения в БД)
+// ReplaceCategories Полная замена категорий (например, после изменения в БД)
 func (b *Board) ReplaceCategories(cats []string) {
 	b.mu.Lock()
 	defer b.mu.Unlock()

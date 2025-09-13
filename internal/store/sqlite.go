@@ -381,3 +381,21 @@ func (s *Store) SetNotification(userID int64, minuteOfDay *int) error {
 	}
 	return tx.Commit()
 }
+
+func (s *Store) UsersWithNotificationAt(minuteOfDay int) ([]int64, error) {
+	rows, err := s.db.Query(`SELECT user_id FROM notification_schedule WHERE minute_of_day = ?`, minuteOfDay)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []int64
+	for rows.Next() {
+		var uid int64
+		if err := rows.Scan(&uid); err != nil {
+			return nil, err
+		}
+		out = append(out, uid)
+	}
+	return out, rows.Err()
+}

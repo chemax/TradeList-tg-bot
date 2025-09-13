@@ -146,7 +146,7 @@ func (b *Bot) Start() {
 
 	// Бэкапы
 	go b.backupLoop()
-
+	b.startReminderLoop()
 	// Апдейты
 	u := tgbotapi.NewUpdate(0)
 	u.Timeout = 60
@@ -847,24 +847,23 @@ func (b *Bot) render(chatID int64) (string, tgbotapi.InlineKeyboardMarkup) {
 		// Экран "Настройка напоминаний"
 		if p.RemindersOpen {
 			// 24 кнопки часов (00..23), по 6 в строке
-			{
-				row := make([]tgbotapi.InlineKeyboardButton, 0, 6)
-				for h := 0; h < 24; h++ {
-					row = append(row,
-						tgbotapi.NewInlineKeyboardButtonData(
-							fmt.Sprintf("%02d", h),
-							fmt.Sprintf("rem:h:%02d", h),
-						),
-					)
-					if len(row) == 6 {
-						rows = append(rows, row)
-						row = make([]tgbotapi.InlineKeyboardButton, 0, 6)
-					}
-				}
-				if len(row) > 0 {
+			row := make([]tgbotapi.InlineKeyboardButton, 0, 6)
+			for h := 0; h < 24; h++ {
+				row = append(row,
+					tgbotapi.NewInlineKeyboardButtonData(
+						fmt.Sprintf("%02d", h),
+						fmt.Sprintf("rem:h:%02d", h),
+					),
+				)
+				if len(row) == 6 {
 					rows = append(rows, row)
+					row = make([]tgbotapi.InlineKeyboardButton, 0, 6)
 				}
 			}
+			if len(row) > 0 {
+				rows = append(rows, row)
+			}
+
 			// Минуты
 			rows = append(rows, []tgbotapi.InlineKeyboardButton{
 				tgbotapi.NewInlineKeyboardButtonData(":00", "rem:m:00"),
@@ -1152,4 +1151,46 @@ func splitCats(s string) []string {
 		}
 	}
 	return out
+}
+
+func (b *Bot) isAllowed(id int64) bool {
+	for _, v := range b.cfg.ChatIDs {
+		if v == id {
+			return true
+		}
+	}
+	return false
+}
+
+func nextHalfHourFrom(t time.Time) time.Time {
+	return t.Truncate(30 * time.Minute).Add(30 * time.Minute)
+}
+
+func (b *Bot) startReminderLoop() {
+	go func() {
+		for {
+			wake := nextHalfHourFrom(time.Now())
+			time.Sleep(time.Until(wake)) // нет лишней активности
+
+			// Точная минута слота
+			minute := wake.Hour()*60 + wake.Minute()
+
+			// Кого слать
+			ids, err := b.store.UsersWithNotificationAt(minute)
+			if err != nil {
+				continue // можно залогировать, но не падаем
+			}
+
+			for _, uid := range ids {
+				// Требование: не слать тем, кого нет в CHAT_IDS
+				if !b.isAllowed(uid) {
+					continue
+				}
+				// Приватный чат: user_id == chat_id
+				msg := tgbotapi.NewMessage(uid, "Напоминание: загляните в список покупок 🛒")
+				_, _ = b.api.Send(msg)
+			}
+			// цикл сам поставит следующий wake
+		}
+	}()
 }
